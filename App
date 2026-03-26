@@ -1,0 +1,1179 @@
+"""
+=============================================================================
+ToxIQ | app.py
+Streamlit Dashboard — Industrial Drug Toxicity Prediction Interface
+=============================================================================
+
+USAGE:
+    streamlit run app.py
+
+    # With pre-trained models:
+    streamlit run app.py -- --model-dir models/
+
+ARCHITECTURE:
+    The Streamlit app acts as the "API gateway" between the end-user and the
+    trained ML models. It:
+        1. Accepts SMILES input from the user
+        2. Runs the cheminformatics pipeline (featurize_molecule)
+        3. Calls all 12 XGBoost models (predict_toxicity)
+        4. Computes SHAP values for the top-risk assay
+        5. Renders: 2D molecule, risk table, SHAP chart, descriptors panel
+
+    For hackathon/demo mode (no pre-trained models), a lightweight demo
+    mode generates synthetic predictions so the UI is always functional.
+
+Author: ToxIQ Engineering Team
+=============================================================================
+"""
+
+import os
+import sys
+import json
+import io
+import warnings
+import logging
+from typing import Optional, Dict, List
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+import joblib
+
+warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.WARNING)
+
+# Add project root to path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# RDKit for molecular rendering
+from rdkit import Chem
+from rdkit.Chem import Draw, AllChem, Descriptors, rdMolDescriptors
+from rdkit import RDLogger
+RDLogger.DisableLog("rdApp.*")
+
+from PIL import Image
+
+# Project modules
+from src.data_pipeline import (
+    featurize_molecule,
+    parse_smiles,
+    compute_physicochemical_descriptors,
+    TOX21_ASSAYS,
+    MORGAN_RADIUS,
+    MORGAN_NBITS,
+)
+
+# =============================================================================
+# PAGE CONFIG — Must be first Streamlit call
+# =============================================================================
+
+st.set_page_config(
+    page_title="ToxIQ — Drug Toxicity Intelligence",
+    page_icon="⚗️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+    menu_items={
+        "Get Help": "https://github.com/your-org/toxiq",
+        "Report a bug": "https://github.com/your-org/toxiq/issues",
+        "About": "ToxIQ — AI-powered drug toxicity prediction using Tox21 dataset",
+    },
+)
+
+# =============================================================================
+# CUSTOM CSS — Biopharma-grade dark theme with molecular aesthetic
+# =============================================================================
+
+CUSTOM_CSS = """
+<style>
+/* Import distinctive fonts */
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,600;1,9..40,300&display=swap');
+
+/* Root variables — clinical dark theme */
+:root {
+    --bg-primary:      #0a0e1a;
+    --bg-secondary:    #0f1628;
+    --bg-card:         #111827;
+    --bg-card-hover:   #161e30;
+    --border-subtle:   #1e2d45;
+    --border-accent:   #2563eb;
+    --text-primary:    #e8f0fe;
+    --text-secondary:  #8ba4c4;
+    --text-muted:      #4a6080;
+    --accent-blue:     #3b82f6;
+    --accent-cyan:     #06b6d4;
+    --accent-green:    #10b981;
+    --accent-amber:    #f59e0b;
+    --accent-red:      #ef4444;
+    --accent-purple:   #8b5cf6;
+    --grid-color:      rgba(37, 99, 235, 0.06);
+    --font-mono:       'Space Mono', monospace;
+    --font-sans:       'DM Sans', sans-serif;
+}
+
+/* Reset Streamlit defaults */
+.stApp {
+    background: var(--bg-primary);
+    font-family: var(--font-sans);
+}
+
+/* Molecular grid background */
+.stApp::before {
+    content: '';
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background-image:
+        linear-gradient(var(--grid-color) 1px, transparent 1px),
+        linear-gradient(90deg, var(--grid-color) 1px, transparent 1px);
+    background-size: 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+}
+
+/* Main content above grid */
+.main .block-container {
+    position: relative;
+    z-index: 1;
+    padding-top: 1.5rem;
+    max-width: 1400px;
+}
+
+/* Sidebar */
+section[data-testid="stSidebar"] {
+    background: var(--bg-secondary) !important;
+    border-right: 1px solid var(--border-subtle);
+}
+
+section[data-testid="stSidebar"] .stMarkdown p,
+section[data-testid="stSidebar"] label {
+    color: var(--text-secondary) !important;
+    font-family: var(--font-sans);
+}
+
+/* Headers */
+h1, h2, h3, h4, h5, h6 {
+    font-family: var(--font-mono) !important;
+    color: var(--text-primary) !important;
+}
+
+/* Text inputs — SMILES field */
+.stTextInput > div > div > input,
+.stTextArea > div > div > textarea {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border-subtle) !important;
+    color: var(--text-primary) !important;
+    font-family: var(--font-mono) !important;
+    font-size: 0.85rem !important;
+    border-radius: 6px !important;
+    transition: border-color 0.2s ease;
+}
+
+.stTextInput > div > div > input:focus,
+.stTextArea > div > div > textarea:focus {
+    border-color: var(--accent-blue) !important;
+    box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15) !important;
+}
+
+/* Buttons */
+.stButton > button {
+    background: linear-gradient(135deg, #1d4ed8, #0ea5e9) !important;
+    color: white !important;
+    border: none !important;
+    font-family: var(--font-mono) !important;
+    font-size: 0.85rem !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.05em;
+    padding: 0.6rem 1.5rem !important;
+    border-radius: 6px !important;
+    transition: all 0.2s ease !important;
+}
+
+.stButton > button:hover {
+    transform: translateY(-1px) !important;
+    box-shadow: 0 8px 24px rgba(59, 130, 246, 0.35) !important;
+}
+
+/* Metric cards */
+[data-testid="metric-container"] {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border-subtle) !important;
+    border-radius: 8px !important;
+    padding: 1rem !important;
+}
+
+[data-testid="stMetricValue"] {
+    color: var(--accent-cyan) !important;
+    font-family: var(--font-mono) !important;
+}
+
+[data-testid="stMetricLabel"] {
+    color: var(--text-secondary) !important;
+    font-size: 0.75rem !important;
+}
+
+/* Dataframe / tables */
+[data-testid="stDataFrame"] {
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border-subtle) !important;
+    border-radius: 8px !important;
+}
+
+/* Alerts */
+.stAlert {
+    background: var(--bg-card) !important;
+    border-radius: 8px !important;
+}
+
+/* Tabs */
+.stTabs [data-baseweb="tab-list"] {
+    background: var(--bg-secondary) !important;
+    border-radius: 8px 8px 0 0 !important;
+    border-bottom: 1px solid var(--border-subtle) !important;
+}
+
+.stTabs [data-baseweb="tab"] {
+    color: var(--text-secondary) !important;
+    font-family: var(--font-mono) !important;
+    font-size: 0.8rem !important;
+    padding: 0.6rem 1.2rem !important;
+}
+
+.stTabs [aria-selected="true"] {
+    color: var(--accent-blue) !important;
+    border-bottom: 2px solid var(--accent-blue) !important;
+}
+
+.stTabs [data-baseweb="tab-panel"] {
+    background: var(--bg-card) !important;
+    border-radius: 0 0 8px 8px !important;
+    border: 1px solid var(--border-subtle) !important;
+    border-top: none !important;
+    padding: 1.5rem !important;
+}
+
+/* Expander */
+.streamlit-expanderHeader {
+    background: var(--bg-card) !important;
+    color: var(--text-primary) !important;
+    font-family: var(--font-mono) !important;
+    border-radius: 6px !important;
+}
+
+/* Selectbox */
+.stSelectbox > div > div {
+    background: var(--bg-card) !important;
+    border-color: var(--border-subtle) !important;
+    color: var(--text-primary) !important;
+    font-family: var(--font-mono) !important;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-primary); }
+::-webkit-scrollbar-thumb { background: var(--border-accent); border-radius: 3px; }
+
+/* Custom card component */
+.toxiq-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 1.25rem 1.5rem;
+    margin-bottom: 1rem;
+}
+
+.toxiq-card-header {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 0.75rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.risk-high   { color: #ef4444; font-weight: 700; }
+.risk-medium { color: #f59e0b; font-weight: 700; }
+.risk-low    { color: #10b981; font-weight: 700; }
+
+/* SMILES example chips */
+.smiles-chip {
+    display: inline-block;
+    background: rgba(59, 130, 246, 0.12);
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    color: #93c5fd;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    padding: 2px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    margin: 2px;
+}
+
+/* Override Streamlit's default text colors */
+.stMarkdown, p, span, div {
+    color: var(--text-secondary);
+}
+
+.stMarkdown strong {
+    color: var(--text-primary);
+}
+
+/* Section divider */
+hr {
+    border: none;
+    border-top: 1px solid var(--border-subtle);
+    margin: 1.5rem 0;
+}
+</style>
+"""
+
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# =============================================================================
+# CONSTANTS & EXAMPLE MOLECULES
+# =============================================================================
+
+MODEL_DIR = "models/"
+
+# Curated example molecules spanning different toxicity profiles
+EXAMPLE_MOLECULES = {
+    "Aspirin (Low risk)":           "CC(=O)Oc1ccccc1C(=O)O",
+    "Bisphenol A (Endocrine)":      "CC(c1ccc(O)cc1)(c1ccc(O)cc1)C",
+    "Tamoxifen (ER modulator)":     "CCC(=C(c1ccccc1)c1ccc(OCCN(C)C)cc1)c1ccccc1",
+    "Dioxin (High toxicity)":       "c1cc2cc3ccc(Oc4cc5c(Oc6ccc(Cl)c(Cl)c6)cc(Cl)cc5c4Cl)cc3oc2c(Cl)c1Cl",
+    "Caffeine (Safe stimulant)":    "Cn1cnc2c1c(=O)n(C)c(=O)n2C",
+    "Ibuprofen (NSAID)":            "CC(C)Cc1ccc(C(C)C(=O)O)cc1",
+    "Rosiglitazone (PPAR-γ agonist)": "CN(CCOc1ccc(CC2SC(=O)NC2=O)cc1)c1ccccn1",
+}
+
+ASSAY_DESCRIPTIONS = {
+    "NR-AR":         "Androgen Receptor — male hormone disruption",
+    "NR-AR-LBD":     "Androgen Receptor (LBD) — refined binding assay",
+    "NR-AhR":        "Aryl Hydrocarbon Receptor — dioxin-like toxicity",
+    "NR-Aromatase":  "Aromatase Inhibition — estrogen synthesis disruption",
+    "NR-ER":         "Estrogen Receptor α — female hormone disruption",
+    "NR-ER-LBD":     "Estrogen Receptor (LBD) — refined binding",
+    "NR-PPAR-gamma": "PPAR-γ — metabolic disruption, weight dysregulation",
+    "SR-ARE":        "Antioxidant Response — oxidative stress signaling",
+    "SR-ATAD5":      "DNA Damage Marker (ATAD5) — genotoxicity",
+    "SR-HSE":        "Heat Shock Response — proteotoxic stress",
+    "SR-MMP":        "Mitochondrial Membrane Potential — organelle toxicity",
+    "SR-p53":        "p53 Pathway — DNA damage & genotoxicity",
+}
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+@st.cache_resource
+def load_trained_models():
+    """
+    Load all trained models from disk (cached across sessions).
+
+    Streamlit's @st.cache_resource ensures models are loaded ONCE
+    and shared across all user sessions — critical for performance.
+    Models are large (~MB each) and loading is slow.
+    """
+    if not os.path.exists(MODEL_DIR):
+        return None, None, None, None
+
+    # Load feature names
+    feature_names_path = os.path.join(MODEL_DIR, "feature_names.pkl")
+    assay_names_path = os.path.join(MODEL_DIR, "assay_names.json")
+
+    if not os.path.exists(feature_names_path):
+        return None, None, None, None
+
+    feature_names = joblib.load(feature_names_path)
+    with open(assay_names_path) as f:
+        assay_names = json.load(f)
+
+    from src.model_trainer import load_models
+    models, scalers = load_models(MODEL_DIR, assay_names)
+
+    return models, scalers, feature_names, assay_names
+
+
+def render_molecule_image(smiles: str, size: tuple = (400, 300)) -> Optional[Image.Image]:
+    """
+    Render 2D molecular structure as a PIL Image.
+
+    RDKit's Draw module generates publication-quality 2D depictions
+    using the RDKit coordinate generation algorithm. We use a dark
+    background to match the dashboard theme.
+    """
+    mol = parse_smiles(smiles)
+    if mol is None:
+        return None
+
+    # Generate 2D coordinates for rendering
+    AllChem.Compute2DCoords(mol)
+
+    # Draw with dark-theme-compatible styling
+    drawer = Draw.rdMolDraw2D.MolDraw2DSVG(size[0], size[1])
+    drawer.drawOptions().addStereoAnnotation = True
+    drawer.drawOptions().addAtomIndices = False
+    drawer.DrawMolecule(mol)
+    drawer.FinishDrawing()
+    svg = drawer.GetDrawingText()
+
+    # Convert SVG to PIL Image via rdkit's PNG renderer
+    img = Draw.MolToImage(mol, size=size, kekulize=True)
+    return img
+
+
+def get_molecular_descriptors_display(smiles: str) -> Optional[pd.DataFrame]:
+    """Format physicochemical descriptors for dashboard display."""
+    mol = parse_smiles(smiles)
+    if mol is None:
+        return None
+
+    desc = compute_physicochemical_descriptors(mol)
+    if desc is None:
+        return None
+
+    # Add Lipinski violation flags — clinical relevance
+    violations = []
+    mw = desc.get("MolWt", 0)
+    logp = desc.get("MolLogP", 0)
+    hbd = desc.get("NumHDonors", 0)
+    hba = desc.get("NumHAcceptors", 0)
+
+    display_data = []
+    descriptor_info = {
+        "MolWt":             ("Molecular Weight (Da)", "Lipinski: < 500 Da", mw > 500),
+        "MolLogP":           ("LogP (Lipophilicity)", "Lipinski: < 5.0", logp > 5),
+        "TPSA":              ("TPSA (Ų)", "< 90 Ų for oral bioavailability", desc.get("TPSA", 0) > 140),
+        "NumHDonors":        ("H-Bond Donors", "Lipinski: ≤ 5", hbd > 5),
+        "NumHAcceptors":     ("H-Bond Acceptors", "Lipinski: ≤ 10", hba > 10),
+        "NumRotatableBonds": ("Rotatable Bonds", "Flexibility indicator", False),
+        "NumAromaticRings":  ("Aromatic Rings", "Toxicophore indicator", desc.get("NumAromaticRings", 0) > 3),
+        "FractionCSP3":      ("Fsp3 (3D-character)", "Drug-likeness: > 0.25", desc.get("FractionCSP3", 0) < 0.25),
+        "NumHeteroatoms":    ("Heteroatoms", "Electronic diversity", False),
+    }
+
+    for key, (label, note, flagged) in descriptor_info.items():
+        val = desc.get(key, "N/A")
+        display_data.append({
+            "Descriptor": label,
+            "Value": f"{val:.2f}" if isinstance(val, float) else str(val),
+            "Note": note,
+            "⚠": "⚠️" if flagged else "✓",
+        })
+
+    return pd.DataFrame(display_data)
+
+
+def generate_demo_predictions(smiles: str) -> pd.DataFrame:
+    """
+    Generate synthetic predictions for demo mode (no trained models).
+
+    Uses molecular properties as a proxy for toxicity probability.
+    This is NOT a real model — it's a demonstration scaffold.
+    LogP and aromaticity are correlated with toxicity in many assays.
+    """
+    mol = parse_smiles(smiles)
+    desc = compute_physicochemical_descriptors(mol) if mol else None
+
+    if desc is None:
+        desc = {k: 0 for k in ["MolLogP", "NumAromaticRings", "TPSA", "MolWt"]}
+
+    # Rough heuristic proxies — not real model predictions
+    logp = desc.get("MolLogP", 2.0)
+    arom = desc.get("NumAromaticRings", 1)
+    tpsa = desc.get("TPSA", 80)
+
+    np.random.seed(hash(smiles) % (2**31))
+
+    results = []
+    for assay in TOX21_ASSAYS:
+        # Crude proxy: lipophilic + aromatic = higher risk
+        base_prob = min(0.15 + 0.04 * logp + 0.06 * arom, 0.85)
+        noise = np.random.uniform(-0.1, 0.1)
+        prob = float(np.clip(base_prob + noise, 0.02, 0.95))
+
+        pathway = "Nuclear Receptor" if assay.startswith("NR-") else "Stress Response"
+
+        if prob < 0.30:
+            risk = "🟢 Low"
+        elif prob < 0.60:
+            risk = "🟡 Moderate"
+        else:
+            risk = "🔴 High"
+
+        results.append({
+            "Assay": assay,
+            "Pathway Type": pathway,
+            "Toxicity Probability": prob,
+            "Risk Level": risk,
+            "Risk Score (%)": round(prob * 100, 1),
+        })
+
+    df = pd.DataFrame(results).sort_values("Toxicity Probability", ascending=False)
+    return df
+
+
+def create_risk_gauge(prob: float, assay_name: str) -> go.Figure:
+    """Create a gauge chart for overall toxicity risk."""
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=prob * 100,
+        title={"text": assay_name, "font": {"color": "#8ba4c4", "size": 12, "family": "Space Mono"}},
+        number={"suffix": "%", "font": {"color": "#e8f0fe", "size": 28, "family": "Space Mono"}},
+        gauge={
+            "axis": {
+                "range": [0, 100],
+                "tickwidth": 1,
+                "tickcolor": "#1e2d45",
+                "tickfont": {"color": "#4a6080", "size": 9},
+            },
+            "bar": {"color": "#2563eb", "thickness": 0.35},
+            "bgcolor": "#111827",
+            "borderwidth": 0,
+            "steps": [
+                {"range": [0, 30], "color": "rgba(16, 185, 129, 0.15)"},
+                {"range": [30, 60], "color": "rgba(245, 158, 11, 0.15)"},
+                {"range": [60, 100], "color": "rgba(239, 68, 68, 0.15)"},
+            ],
+            "threshold": {
+                "line": {"color": "#ef4444", "width": 2},
+                "thickness": 0.85,
+                "value": 60,
+            },
+        },
+    ))
+
+    fig.update_layout(
+        height=200,
+        margin=dict(t=40, b=10, l=20, r=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#e8f0fe"},
+    )
+    return fig
+
+
+def create_risk_heatmap(pred_df: pd.DataFrame) -> go.Figure:
+    """
+    Create an interactive risk heatmap across all 12 assays.
+
+    Visualization choice: horizontal bar chart with color encoding
+    is more readable than a true heatmap for 12 ordered tasks.
+    """
+    df_sorted = pred_df.sort_values("Toxicity Probability", ascending=True)
+
+    colors = []
+    for prob in df_sorted["Toxicity Probability"]:
+        if prob < 0.30:
+            colors.append("#10b981")
+        elif prob < 0.60:
+            colors.append("#f59e0b")
+        else:
+            colors.append("#ef4444")
+
+    fig = go.Figure(go.Bar(
+        x=df_sorted["Toxicity Probability"] * 100,
+        y=df_sorted["Assay"],
+        orientation="h",
+        marker={
+            "color": colors,
+            "line": {"color": "rgba(255,255,255,0.05)", "width": 0.5},
+        },
+        text=[f"{v:.1f}%" for v in df_sorted["Toxicity Probability"] * 100],
+        textposition="outside",
+        textfont={"color": "#8ba4c4", "size": 10, "family": "Space Mono"},
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Risk Probability: %{x:.1f}%<br>"
+            "<extra></extra>"
+        ),
+    ))
+
+    # Add threshold lines
+    fig.add_vline(x=30, line_dash="dash", line_color="rgba(16,185,129,0.4)", line_width=1)
+    fig.add_vline(x=60, line_dash="dash", line_color="rgba(239,68,68,0.4)", line_width=1)
+    fig.add_annotation(x=30, y=0, text="Low/Mod", showarrow=False,
+                       font={"size": 8, "color": "#4a6080"}, yref="paper")
+    fig.add_annotation(x=60, y=0, text="Mod/High", showarrow=False,
+                       font={"size": 8, "color": "#4a6080"}, yref="paper")
+
+    fig.update_layout(
+        title={"text": "Toxicity Risk Profile — All 12 Assays", "font": {"size": 14, "color": "#8ba4c4", "family": "Space Mono"}},
+        xaxis={
+            "title": "Risk Probability (%)",
+            "range": [0, 110],
+            "gridcolor": "#1e2d45",
+            "tickfont": {"color": "#4a6080", "family": "Space Mono", "size": 10},
+            "title_font": {"color": "#8ba4c4", "family": "Space Mono", "size": 11},
+        },
+        yaxis={
+            "tickfont": {"color": "#8ba4c4", "family": "Space Mono", "size": 10},
+        },
+        height=420,
+        margin=dict(t=50, b=40, l=120, r=80),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(17,24,39,0.6)",
+        showlegend=False,
+    )
+    return fig
+
+
+def create_shap_chart(feature_names: List[str], shap_vals: np.ndarray, top_n: int = 15) -> go.Figure:
+    """
+    Create SHAP feature importance waterfall chart.
+
+    INTERPRETATION GUIDE:
+        - Each bar = one feature's contribution to the toxicity prediction
+        - Red bars (positive SHAP): INCREASE toxicity probability
+        - Blue bars (negative SHAP): DECREASE toxicity probability
+        - FP_bit_XXX features: specific molecular substructures
+        - Named descriptors (LogP, TPSA, etc.): global molecular properties
+
+    The chemist reads this as: "bit_847 pushed the probability up by +0.12,
+    which likely corresponds to an aromatic nitrogen substructure."
+    """
+    # Average absolute SHAP values across samples (if multiple)
+    if shap_vals.ndim > 1:
+        mean_shap = np.mean(shap_vals, axis=0)
+    else:
+        mean_shap = shap_vals
+
+    # Get top N features by absolute impact
+    top_indices = np.argsort(np.abs(mean_shap))[-top_n:]
+    top_shap = mean_shap[top_indices]
+    top_names = [feature_names[i] for i in top_indices]
+
+    # Shorten FP bit names for display
+    display_names = []
+    for name in top_names:
+        if name.startswith("FP_bit_"):
+            display_names.append(f"Bit {name.split('_')[-1]}")
+        else:
+            display_names.append(name)
+
+    colors = ["#ef4444" if v > 0 else "#3b82f6" for v in top_shap]
+
+    fig = go.Figure(go.Bar(
+        x=top_shap,
+        y=display_names,
+        orientation="h",
+        marker={
+            "color": colors,
+            "line": {"color": "rgba(255,255,255,0.05)", "width": 0.5},
+        },
+        text=[f"{v:+.4f}" for v in top_shap],
+        textposition="outside",
+        textfont={"color": "#8ba4c4", "size": 9, "family": "Space Mono"},
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "SHAP Value: %{x:.4f}<br>"
+            "<extra></extra>"
+        ),
+    ))
+
+    fig.add_vline(x=0, line_color="#4a6080", line_width=1)
+
+    fig.update_layout(
+        title={
+            "text": "SHAP Feature Attribution — Which Structures Drive Toxicity?",
+            "font": {"size": 13, "color": "#8ba4c4", "family": "Space Mono"},
+        },
+        xaxis={
+            "title": "SHAP Value (log-odds contribution)",
+            "gridcolor": "#1e2d45",
+            "tickfont": {"color": "#4a6080", "family": "Space Mono", "size": 9},
+            "title_font": {"color": "#8ba4c4", "family": "Space Mono", "size": 10},
+            "zeroline": False,
+        },
+        yaxis={
+            "tickfont": {"color": "#8ba4c4", "family": "Space Mono", "size": 9},
+        },
+        height=480,
+        margin=dict(t=50, b=40, l=100, r=100),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(17,24,39,0.6)",
+        showlegend=False,
+        annotations=[
+            dict(
+                x=0.01, y=1.02, xref="paper", yref="paper",
+                text="🔴 Red = increases toxicity    🔵 Blue = decreases toxicity",
+                showarrow=False, font={"size": 9, "color": "#4a6080", "family": "Space Mono"},
+            )
+        ],
+    )
+    return fig
+
+
+def create_radar_chart(pred_df: pd.DataFrame) -> go.Figure:
+    """Radar chart for quick multi-dimensional toxicity overview."""
+    assays = pred_df["Assay"].tolist()
+    probs = pred_df["Toxicity Probability"].tolist()
+
+    # Close the polygon
+    assays_closed = assays + [assays[0]]
+    probs_closed = probs + [probs[0]]
+
+    fig = go.Figure()
+
+    # Risk fill zones
+    n = len(assays)
+    fig.add_trace(go.Scatterpolar(
+        r=[0.3] * (n + 1), theta=assays_closed,
+        fill="toself", fillcolor="rgba(16,185,129,0.05)",
+        line={"color": "rgba(16,185,129,0.2)", "dash": "dot", "width": 1},
+        showlegend=False, hoverinfo="skip",
+    ))
+    fig.add_trace(go.Scatterpolar(
+        r=[0.6] * (n + 1), theta=assays_closed,
+        fill="toself", fillcolor="rgba(245,158,11,0.05)",
+        line={"color": "rgba(245,158,11,0.2)", "dash": "dot", "width": 1},
+        showlegend=False, hoverinfo="skip",
+    ))
+
+    # Actual prediction
+    fig.add_trace(go.Scatterpolar(
+        r=probs_closed, theta=assays_closed,
+        fill="toself",
+        fillcolor="rgba(59,130,246,0.15)",
+        line={"color": "#3b82f6", "width": 2},
+        marker={"size": 6, "color": "#06b6d4"},
+        name="Toxicity Profile",
+        hovertemplate="<b>%{theta}</b><br>Risk: %{r:.1%}<extra></extra>",
+    ))
+
+    fig.update_layout(
+        polar={
+            "radialaxis": {
+                "range": [0, 1],
+                "tickformat": ".0%",
+                "tickfont": {"size": 8, "color": "#4a6080", "family": "Space Mono"},
+                "gridcolor": "#1e2d45",
+                "linecolor": "#1e2d45",
+            },
+            "angularaxis": {
+                "tickfont": {"size": 8, "color": "#8ba4c4", "family": "Space Mono"},
+                "linecolor": "#1e2d45",
+                "gridcolor": "#1e2d45",
+            },
+            "bgcolor": "rgba(17,24,39,0.6)",
+        },
+        title={"text": "Multi-Assay Toxicity Radar", "font": {"size": 13, "color": "#8ba4c4", "family": "Space Mono"}},
+        paper_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+        height=380,
+        margin=dict(t=50, b=20, l=50, r=50),
+    )
+    return fig
+
+
+# =============================================================================
+# SIDEBAR
+# =============================================================================
+
+def render_sidebar():
+    """Render the sidebar with app info and example molecules."""
+    with st.sidebar:
+        st.markdown("""
+<div style="text-align:center; padding: 1rem 0 1.5rem;">
+    <div style="font-family:'Space Mono',monospace; font-size:1.6rem; color:#3b82f6; letter-spacing:0.08em; font-weight:700;">
+        ⚗️ ToxIQ
+    </div>
+    <div style="font-family:'Space Mono',monospace; font-size:0.65rem; color:#4a6080; letter-spacing:0.15em; text-transform:uppercase; margin-top:4px;">
+        Drug Toxicity Intelligence Platform
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        st.markdown("""
+<div style="font-family:'Space Mono',monospace; font-size:0.65rem; color:#4a6080; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:0.75rem;">
+    Quick Load Examples
+</div>
+""", unsafe_allow_html=True)
+
+        for name, smi in EXAMPLE_MOLECULES.items():
+            if st.button(name, key=f"btn_{name}", use_container_width=True):
+                st.session_state["smiles_input"] = smi
+
+        st.markdown("---")
+
+        st.markdown("""
+<div style="font-family:'Space Mono',monospace; font-size:0.65rem; color:#4a6080; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:0.75rem;">
+    Model Architecture
+</div>
+<div style="font-size:0.75rem; color:#8ba4c4; line-height:1.6;">
+    <strong style="color:#e8f0fe;">Algorithm:</strong> XGBoost (GBDT)<br>
+    <strong style="color:#e8f0fe;">Tasks:</strong> 12 Tox21 assays<br>
+    <strong style="color:#e8f0fe;">Features:</strong> 2048 ECFP4 bits<br>
+    <strong style="color:#e8f0fe;">+ Descriptors:</strong> 13 physicochemical<br>
+    <strong style="color:#e8f0fe;">XAI:</strong> SHAP TreeExplainer<br>
+    <strong style="color:#e8f0fe;">Imbalance:</strong> scale_pos_weight
+</div>
+""", unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        st.markdown("""
+<div style="font-family:'Space Mono',monospace; font-size:0.65rem; color:#4a6080; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:0.5rem;">
+    Risk Thresholds
+</div>
+<div style="font-size:0.75rem; line-height:1.8;">
+    <span style="color:#10b981;">🟢 Low:</span> <span style="color:#8ba4c4;">< 30% probability</span><br>
+    <span style="color:#f59e0b;">🟡 Moderate:</span> <span style="color:#8ba4c4;">30–60%</span><br>
+    <span style="color:#ef4444;">🔴 High:</span> <span style="color:#8ba4c4;">> 60% probability</span>
+</div>
+""", unsafe_allow_html=True)
+
+        st.markdown("---")
+
+        st.markdown("""
+<div style="font-size:0.65rem; color:#2a3f5a; text-align:center; font-family:'Space Mono',monospace; margin-top:1rem;">
+    Built for CODECURE AI Hackathon<br>
+    Track A — Drug Toxicity Prediction<br>
+    Powered by RDKit + XGBoost + SHAP
+</div>
+""", unsafe_allow_html=True)
+
+
+# =============================================================================
+# MAIN APP
+# =============================================================================
+
+def main():
+    """Main application entry point."""
+
+    render_sidebar()
+
+    # --- HEADER ---
+    col_title, col_status = st.columns([3, 1])
+    with col_title:
+        st.markdown("""
+<div style="margin-bottom:0.5rem;">
+    <span style="font-family:'Space Mono',monospace; font-size:2rem; font-weight:700; color:#e8f0fe; letter-spacing:-0.02em;">
+        ToxIQ
+    </span>
+    <span style="font-family:'Space Mono',monospace; font-size:0.75rem; color:#3b82f6; letter-spacing:0.1em; margin-left:12px;">
+        v2.0 · PRODUCTION
+    </span>
+</div>
+<div style="font-family:'DM Sans',sans-serif; font-size:0.95rem; color:#8ba4c4; max-width:600px; line-height:1.5;">
+    AI-powered drug toxicity prediction across 12 Tox21 assays.
+    Input any SMILES string — get instant multi-pathway risk assessment with explainable AI.
+</div>
+""", unsafe_allow_html=True)
+
+    with col_status:
+        models, scalers, feature_names, assay_names = load_trained_models()
+        if models:
+            st.metric("Models Loaded", f"{len(models)}/12", "✓ LIVE")
+        else:
+            st.metric("Models Loaded", "DEMO MODE", "⚡")
+            st.caption("Run `python train.py` to enable full predictions")
+
+    st.markdown("---")
+
+    # --- INPUT SECTION ---
+    st.markdown("""
+<div style="font-family:'Space Mono',monospace; font-size:0.7rem; color:#4a6080; letter-spacing:0.12em; text-transform:uppercase; margin-bottom:0.5rem;">
+    Molecular Input
+</div>
+""", unsafe_allow_html=True)
+
+    # Initialize session state
+    if "smiles_input" not in st.session_state:
+        st.session_state["smiles_input"] = "CC(=O)Oc1ccccc1C(=O)O"  # Aspirin default
+
+    col_input, col_btn = st.columns([5, 1])
+
+    with col_input:
+        smiles_input = st.text_input(
+            "SMILES String",
+            value=st.session_state["smiles_input"],
+            placeholder="Enter a valid SMILES string... e.g. CC(=O)Oc1ccccc1C(=O)O",
+            help="SMILES (Simplified Molecular Input Line Entry System) — the universal chemical notation",
+            label_visibility="collapsed",
+        )
+        st.session_state["smiles_input"] = smiles_input
+
+    with col_btn:
+        analyze_clicked = st.button("⚗️ ANALYZE", use_container_width=True)
+
+    # Validate SMILES in real-time
+    if smiles_input:
+        mol = parse_smiles(smiles_input)
+        if mol is None:
+            st.error("❌ Invalid SMILES string. Please check the molecular notation.")
+            return
+        else:
+            n_atoms = mol.GetNumAtoms()
+            n_bonds = mol.GetNumBonds()
+            st.caption(
+                f"✓ Valid molecule · {n_atoms} atoms · {n_bonds} bonds · "
+                f"MW = {Descriptors.MolWt(mol):.1f} Da"
+            )
+
+    if not smiles_input or parse_smiles(smiles_input) is None:
+        # Show welcome screen
+        st.markdown("""
+<div class="toxiq-card" style="text-align:center; padding:3rem;">
+    <div style="font-size:3rem; margin-bottom:1rem;">⚗️</div>
+    <div style="font-family:'Space Mono',monospace; font-size:1rem; color:#8ba4c4; margin-bottom:0.5rem;">
+        Enter a SMILES string to begin toxicity analysis
+    </div>
+    <div style="font-size:0.8rem; color:#4a6080;">
+        Try one of the example molecules from the sidebar →
+    </div>
+</div>
+""", unsafe_allow_html=True)
+        return
+
+    # Run analysis on button click OR when SMILES changes (auto-run)
+    # --- ANALYSIS ---
+    with st.spinner("Running cheminformatics pipeline and toxicity prediction..."):
+
+        # Get predictions
+        if models and scalers and feature_names:
+            from src.model_trainer import predict_toxicity
+            pred_df = predict_toxicity(smiles_input, models, scalers, feature_names)
+            is_demo = False
+        else:
+            pred_df = generate_demo_predictions(smiles_input)
+            is_demo = True
+
+        if pred_df is None:
+            st.error("Prediction failed. The molecule could not be featurized.")
+            return
+
+    if is_demo:
+        st.info(
+            "⚡ **Demo Mode** — Showing heuristic predictions. "
+            "Run `python train.py --data tox21.csv` to enable real XGBoost predictions.",
+            icon="⚡",
+        )
+
+    # ============================================================
+    # RESULTS LAYOUT
+    # ============================================================
+
+    # --- TOP ROW: Molecule + Overall Risk + Key Metrics ---
+    top_left, top_right = st.columns([1, 2])
+
+    with top_left:
+        st.markdown("""
+<div class="toxiq-card-header">Molecular Structure</div>
+""", unsafe_allow_html=True)
+
+        mol_img = render_molecule_image(smiles_input, size=(380, 280))
+        if mol_img:
+            st.image(mol_img, use_column_width=True, caption=f"2D Depiction · ECFP4 radius=2")
+        else:
+            st.warning("Could not render molecule")
+
+        # Canonical SMILES
+        canonical = Chem.MolToSmiles(parse_smiles(smiles_input))
+        st.code(canonical, language=None)
+
+    with top_right:
+        # Key risk metrics
+        n_high = len(pred_df[pred_df["Toxicity Probability"] >= 0.6])
+        n_mod  = len(pred_df[(pred_df["Toxicity Probability"] >= 0.3) & (pred_df["Toxicity Probability"] < 0.6)])
+        n_low  = len(pred_df[pred_df["Toxicity Probability"] < 0.3])
+        max_risk = pred_df["Toxicity Probability"].max()
+        top_assay = pred_df.iloc[0]["Assay"]
+
+        m1, m2, m3, m4 = st.columns(4)
+        with m1:
+            st.metric("🔴 High Risk", n_high, f"assays")
+        with m2:
+            st.metric("🟡 Moderate", n_mod, "assays")
+        with m3:
+            st.metric("🟢 Low Risk", n_low, "assays")
+        with m4:
+            st.metric("Peak Risk", f"{max_risk:.1%}", top_assay)
+
+        # Gauge for highest-risk assay
+        gauge_fig = create_risk_gauge(max_risk, f"Max Risk: {top_assay}")
+        st.plotly_chart(gauge_fig, use_container_width=True, config={"displayModeBar": False})
+
+        # Radar chart
+        radar_fig = create_radar_chart(pred_df)
+        st.plotly_chart(radar_fig, use_container_width=True, config={"displayModeBar": False})
+
+    st.markdown("---")
+
+    # --- TABS: Detailed Results ---
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📊 Risk Profile",
+        "🧬 XAI / SHAP Analysis",
+        "⚗️ Molecular Descriptors",
+        "📋 Full Prediction Table",
+    ])
+
+    with tab1:
+        bar_fig = create_risk_heatmap(pred_df)
+        st.plotly_chart(bar_fig, use_container_width=True, config={"displayModeBar": False})
+
+        # Assay descriptions
+        st.markdown("""
+<div style="font-family:'Space Mono',monospace; font-size:0.65rem; color:#4a6080; letter-spacing:0.12em; text-transform:uppercase; margin: 1rem 0 0.5rem;">
+    Assay Biological Context
+</div>
+""", unsafe_allow_html=True)
+
+        high_risk_assays = pred_df[pred_df["Toxicity Probability"] >= 0.3]["Assay"].tolist()
+        for assay in high_risk_assays[:6]:  # Show top 6 flagged
+            desc = ASSAY_DESCRIPTIONS.get(assay, "")
+            prob = pred_df[pred_df["Assay"] == assay]["Toxicity Probability"].values[0]
+            color = "#ef4444" if prob >= 0.6 else "#f59e0b"
+            st.markdown(
+                f'<div style="display:flex; align-items:center; margin:4px 0; font-size:0.8rem;">'
+                f'<span style="color:{color}; font-family:Space Mono; min-width:140px;">{assay}</span>'
+                f'<span style="color:#4a6080; margin:0 8px;">·</span>'
+                f'<span style="color:#8ba4c4;">{desc}</span>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    with tab2:
+        st.markdown("""
+<div style="font-size:0.8rem; color:#8ba4c4; margin-bottom:1rem; line-height:1.6;">
+    <strong style="color:#e8f0fe;">SHAP (SHapley Additive exPlanations)</strong> reveals which molecular features
+    drive the toxicity prediction. Red bars = substructures that increase toxicity risk.
+    Blue bars = features that reduce risk. This enables medicinal chemists to identify
+    and modify <em>structural alerts</em>.
+</div>
+""", unsafe_allow_html=True)
+
+        # Select assay for SHAP analysis
+        assay_for_shap = st.selectbox(
+            "Select assay for SHAP analysis",
+            options=pred_df["Assay"].tolist(),
+            index=0,
+            help="Choose the toxicity assay to explain",
+        )
+
+        if models and scalers and feature_names:
+            # Real SHAP from trained model
+            fp, desc_dict = featurize_molecule(smiles_input)
+            if fp is not None and assay_for_shap in models:
+                desc_vals = np.array(list(desc_dict.values()), dtype=np.float32)
+                x_raw = np.concatenate([fp, desc_vals]).reshape(1, -1)
+                x = x_raw.copy()
+                x[:, 2048:] = scalers[assay_for_shap].transform(x[:, 2048:])
+
+                from src.model_trainer import compute_shap_values
+                shap_vals = compute_shap_values(
+                    models[assay_for_shap], x, feature_names, assay_for_shap
+                )
+
+                if shap_vals is not None:
+                    shap_fig = create_shap_chart(feature_names, shap_vals[0])
+                    st.plotly_chart(shap_fig, use_container_width=True)
+                else:
+                    st.warning("SHAP computation unavailable for this assay.")
+        else:
+            # Demo SHAP — synthetic values for illustration
+            st.info("Demo mode: showing illustrative SHAP values. Real values require trained models.")
+            fp, _ = featurize_molecule(smiles_input)
+            if fp is not None:
+                np.random.seed(42)
+                mock_shap = (fp.astype(float) - 0.5) * np.random.exponential(0.02, len(fp))
+
+                # Add some named descriptor contributions
+                desc_vals = np.array([0.08, -0.04, 0.12, -0.02, 0.06, 0.01, 0.09, -0.03, -0.01, 0.02, 0.01, 0.01, 0.00])
+                shap_demo = np.concatenate([mock_shap, desc_vals])
+
+                demo_features = [f"FP_bit_{i}" for i in range(2048)] + [
+                    "MolWt", "MolLogP", "NumHDonors", "NumHAcceptors", "TPSA",
+                    "NumRotatableBonds", "NumAromaticRings", "FractionCSP3", "RingCount",
+                    "MaxPartialCharge", "MinPartialCharge", "NumHeteroatoms", "NumStereocenters"
+                ]
+                shap_fig = create_shap_chart(demo_features, shap_demo)
+                st.plotly_chart(shap_fig, use_container_width=True)
+
+    with tab3:
+        desc_df = get_molecular_descriptors_display(smiles_input)
+        if desc_df is not None:
+            st.markdown("""
+<div style="font-size:0.8rem; color:#8ba4c4; margin-bottom:1rem;">
+    Physicochemical descriptors predict ADMET properties — how a drug is Absorbed,
+    Distributed, Metabolized, Excreted, and its Toxicity profile.
+    <strong style="color:#e8f0fe;">⚠️</strong> = Lipinski / drug-likeness violation flagged.
+</div>
+""", unsafe_allow_html=True)
+
+            st.dataframe(
+                desc_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Descriptor": st.column_config.TextColumn("Descriptor", width=200),
+                    "Value": st.column_config.TextColumn("Value", width=100),
+                    "Note": st.column_config.TextColumn("Pharmacological Context", width=300),
+                    "⚠": st.column_config.TextColumn("Flag", width=60),
+                },
+            )
+
+            # Lipinski summary
+            mol = parse_smiles(smiles_input)
+            desc = compute_physicochemical_descriptors(mol)
+            violations = sum([
+                desc.get("MolWt", 0) > 500,
+                desc.get("MolLogP", 0) > 5,
+                desc.get("NumHDonors", 0) > 5,
+                desc.get("NumHAcceptors", 0) > 10,
+            ])
+
+            if violations == 0:
+                st.success("✓ Passes Lipinski's Rule of Five — good oral bioavailability predicted")
+            elif violations <= 1:
+                st.warning(f"⚠️ {violations} Lipinski violation — borderline drug-likeness")
+            else:
+                st.error(f"❌ {violations} Lipinski violations — poor oral bioavailability predicted")
+
+    with tab4:
+        st.markdown("""
+<div style="font-size:0.8rem; color:#8ba4c4; margin-bottom:1rem;">
+    Complete prediction results across all 12 Tox21 assays.
+    Sorted by toxicity probability (highest risk first).
+</div>
+""", unsafe_allow_html=True)
+
+        # Color-coded table
+        styled_df = pred_df[["Assay", "Pathway Type", "Risk Score (%)", "Risk Level"]].copy()
+
+        st.dataframe(
+            styled_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Assay": st.column_config.TextColumn("Assay", width=150),
+                "Pathway Type": st.column_config.TextColumn("Pathway", width=160),
+                "Risk Score (%)": st.column_config.ProgressColumn(
+                    "Risk Score (%)",
+                    min_value=0,
+                    max_value=100,
+                    format="%.1f%%",
+                    width=200,
+                ),
+                "Risk Level": st.column_config.TextColumn("Risk Level", width=130),
+            },
+        )
+
+        # Download button
+        csv_data = pred_df.to_csv(index=False)
+        st.download_button(
+            label="📥 Download Full Results (CSV)",
+            data=csv_data,
+            file_name=f"toxiq_results_{smiles_input[:20].replace('/', '_')}.csv",
+            mime="text/csv",
+        )
+
+
+if __name__ == "__main__":
+    main()
