@@ -422,7 +422,7 @@ These are consistent with the top-performing methods in the 2014 Tox21 Data Chal
 
 ---
 
-## Team life-link
+## Author: Yashvendra singh (devloper) 
 
 — Track A: Drug Toxicity Prediction (Pharmacology + AI)
 
