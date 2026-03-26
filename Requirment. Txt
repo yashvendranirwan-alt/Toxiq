@@ -1,0 +1,44 @@
+# =============================================================================
+# ToxIQ — Drug Toxicity Prediction Platform
+# requirements.txt
+# =============================================================================
+# Python >= 3.9 recommended
+# Install with: pip install -r requirements.txt
+
+# --- Core Scientific Stack ---
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.11.0
+
+# --- Cheminformatics (RDKit) ---
+# RDKit is the gold-standard open-source toolkit for cheminformatics.
+# It handles SMILES parsing, molecular fingerprinting, descriptor calculation,
+# and 2D/3D structure generation.
+rdkit>=2023.3.1
+
+# --- Machine Learning ---
+scikit-learn>=1.3.0
+xgboost>=2.0.0
+imbalanced-learn>=0.11.0   # SMOTE for class imbalance
+
+# --- Explainable AI ---
+# SHAP (SHapley Additive exPlanations) provides game-theory-based
+# feature attributions that work with any model.
+shap>=0.44.0
+
+# --- Data Visualization ---
+matplotlib>=3.7.0
+seaborn>=0.12.0
+plotly>=5.17.0
+
+# --- Streamlit Dashboard ---
+streamlit>=1.28.0
+streamlit-option-menu>=0.3.6
+
+# --- Data Handling ---
+requests>=2.31.0
+tqdm>=4.66.0
+joblib>=1.3.0             # Model serialization
+
+# --- Molecular Image Rendering ---
+Pillow>=10.0.0
