@@ -1,0 +1,577 @@
+"""
+=============================================================================
+ToxIQ | src/data_pipeline.py
+Data Engineering & Cheminformatics Feature Extraction
+=============================================================================
+
+PURPOSE:
+    Ingest the Tox21 dataset, handle all quality issues (missing values,
+    class imbalances, invalid SMILES), convert molecular structures to
+    machine-learning-ready numerical representations, and produce a clean
+    feature matrix + label matrix for model training.
+
+BIOLOGICAL CONTEXT:
+    The Tox21 dataset covers 12 nuclear receptor and stress-response pathway
+    assays. Each assay measures a different toxicological endpoint:
+        - Nuclear receptor pathways (AR, ER, PPAR-γ, etc.) → endocrine disruption
+        - Stress-response pathways (p53, ARE, HSE, MMP, ATAD5) → genotoxicity,
+          oxidative stress, mitochondrial damage
+
+    A compound "active" in any of these assays is a structural alert — it
+    carries real risk for human health. Our model must learn these patterns.
+
+ENGINEERING DECISIONS:
+    1. Morgan Fingerprints (ECFP4) → capture topological chemical neighborhoods
+    2. Physicochemical descriptors → Lipinski-space features for ADMET reasoning
+    3. SMOTE on each task independently → address severe class imbalance
+    4. Canonical SMILES → ensure deterministic, standardized molecule representation
+
+Author: ToxIQ Engineering Team
+=============================================================================
+"""
+
+import os
+import warnings
+import logging
+from typing import Tuple, List, Optional
+
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+# RDKit — the professional cheminformatics toolkit
+# All molecular operations go through RDKit; never process SMILES as raw text.
+from rdkit import Chem
+from rdkit.Chem import (
+    AllChem,           # Extended functionality: fingerprints, reactions
+    Descriptors,       # Physicochemical descriptors (MW, LogP, etc.)
+    rdMolDescriptors,  # Additional descriptor calculations (TPSA, HBD/A)
+)
+from rdkit import RDLogger
+
+# Suppress RDKit's verbose warnings during batch processing
+RDLogger.DisableLog("rdApp.*")
+warnings.filterwarnings("ignore")
+
+# Configure structured logging — production systems need traceable logs
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("ToxIQ.DataPipeline")
+
+# =============================================================================
+# CONSTANTS — The 12 Tox21 Assay Targets
+# =============================================================================
+# These 12 assays represent critical toxicological endpoints.
+# Each is a binary classification task: 1 = toxic/active, 0 = non-toxic.
+
+TOX21_ASSAYS = [
+    "NR-AR",        # Androgen Receptor — endocrine disruption (male hormones)
+    "NR-AR-LBD",    # Androgen Receptor Ligand Binding Domain — more specific AR test
+    "NR-AhR",       # Aryl Hydrocarbon Receptor — dioxin-like toxicity, carcinogenicity
+    "NR-Aromatase", # Aromatase Enzyme Inhibition — disrupts estrogen synthesis
+    "NR-ER",        # Estrogen Receptor Alpha — endocrine disruption (female hormones)
+    "NR-ER-LBD",    # Estrogen Receptor LBD — refined ER binding
+    "NR-PPAR-gamma",# Peroxisome Proliferator-Activated Receptor γ — metabolic disruption
+    "SR-ARE",       # Antioxidant Response Element — oxidative stress signaling
+    "SR-ATAD5",     # ATAD5 (DNA damage marker) — genotoxicity indicator
+    "SR-HSE",       # Heat Shock Element — proteotoxic/cellular stress
+    "SR-MMP",       # Mitochondrial Membrane Potential — mitochondrial toxicity
+    "SR-p53",       # p53 Tumor Suppressor — DNA damage / genotoxicity
+]
+
+# Fingerprint configuration — ECFP4 is the pharmaceutical industry standard
+MORGAN_RADIUS = 2        # Radius 2 = ECFP4: captures 4-bond chemical neighborhoods
+MORGAN_NBITS = 2048      # 2048 bits gives excellent coverage with manageable dimensionality
+
+
+# =============================================================================
+# SECTION 1: SMILES Validation & Molecular Parsing
+# =============================================================================
+
+def parse_smiles(smiles: str) -> Optional[Chem.Mol]:
+    """
+    Safely parse a SMILES string into an RDKit Mol object.
+
+    WHY THIS MATTERS:
+        Raw SMILES strings can be malformed, contain undefined stereocenters,
+        or represent molecules that fail valence checks. We MUST validate
+        before featurization — a silent failure here would corrupt training data.
+
+    The function:
+        1. Parses the SMILES string
+        2. Sanitizes the molecule (valence, aromaticity, ring perception)
+        3. Returns None if any step fails — caller handles None gracefully
+
+    Args:
+        smiles: A SMILES string (e.g., "CC(=O)Oc1ccccc1C(=O)O" for aspirin)
+
+    Returns:
+        RDKit Mol object if valid, None otherwise
+    """
+    if not isinstance(smiles, str) or not smiles.strip():
+        return None
+
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        # MolFromSmiles returns None for invalid SMILES without raising an exception
+        if mol is None:
+            return None
+        # Sanitization catches issues like wrong valences that MolFromSmiles misses
+        Chem.SanitizeMol(mol)
+        return mol
+    except Exception:
+        return None
+
+
+def canonicalize_smiles(smiles: str) -> Optional[str]:
+    """
+    Convert any valid SMILES to its canonical (standardized) form.
+
+    WHY CANONICAL SMILES?
+        The same molecule can be represented in many SMILES notations:
+            Aspirin: "CC(=O)Oc1ccccc1C(=O)O" or "O=C(C)Oc1ccccc1C(=O)O"
+        Canonical SMILES gives ONE unique representation per molecule,
+        ensuring reproducibility and preventing duplicate entries.
+    """
+    mol = parse_smiles(smiles)
+    if mol is None:
+        return None
+    return Chem.MolToSmiles(mol, isomericSmiles=True)
+
+
+# =============================================================================
+# SECTION 2: Molecular Featurization
+# =============================================================================
+
+def compute_morgan_fingerprint(mol: Chem.Mol, radius: int = MORGAN_RADIUS,
+                                n_bits: int = MORGAN_NBITS) -> Optional[np.ndarray]:
+    """
+    Compute Morgan Fingerprint (ECFP — Extended Connectivity Fingerprint).
+
+    THE THEORY OF MORGAN FINGERPRINTS:
+        Morgan fingerprints encode the chemical neighborhood of each atom
+        in the molecule. With radius=2, each bit represents the presence
+        of a unique substructure extending 2 bonds from a central atom.
+
+        This is the ECFP4 fingerprint — arguably the most successful molecular
+        representation in cheminformatics. It is:
+            - Topology-based: captures WHAT atoms and bonds exist nearby
+            - Circular: grows outward from each atom like concentric rings
+            - Hashed: 2048 bits via hash collisions (rare, acceptable)
+            - Translation-invariant: works regardless of molecule orientation
+
+        WHY NOT JUST USE SMILES AS TEXT?
+            NLP on SMILES treats "CC(C)" and "C(C)C" as different strings,
+            but they're the SAME molecule (isobutane). Morgan fingerprints
+            are invariant to atom ordering — they capture chemical reality,
+            not string representation.
+
+        IN PRACTICE:
+            A bit set to 1 at position 847 might mean "there is a nitrogen
+            atom adjacent to an aromatic ring within 2 bonds." This is
+            chemically meaningful. SHAP will later tell us which of these
+            bits drive toxicity.
+
+    Args:
+        mol: Valid RDKit Mol object
+        radius: Circular fingerprint radius (2 = ECFP4 industry standard)
+        n_bits: Bit vector length (2048 provides good coverage)
+
+    Returns:
+        numpy array of shape (n_bits,) with 0/1 values
+    """
+    if mol is None:
+        return None
+
+    try:
+        fp = AllChem.GetMorganFingerprintAsBitVect(
+            mol,
+            radius=radius,
+            nBits=n_bits,
+            useChirality=True,   # Chirality matters! Thalidomide is the classic example.
+            useFeatures=False,   # Pure topology, not pharmacophore features
+        )
+        return np.array(fp)
+    except Exception:
+        return None
+
+
+def compute_physicochemical_descriptors(mol: Chem.Mol) -> Optional[dict]:
+    """
+    Calculate key physicochemical descriptors used in drug discovery.
+
+    LIPINSKI'S RULE OF FIVE (Ro5) BACKGROUND:
+        Christopher Lipinski's 1997 analysis showed that orally bioavailable
+        drugs tend to obey: MW < 500, LogP < 5, HBD ≤ 5, HBA ≤ 10.
+        These descriptors predict ADMET properties (Absorption, Distribution,
+        Metabolism, Excretion, Toxicity) — the core of drug safety assessment.
+
+    DESCRIPTOR EXPLANATIONS:
+        MolWt (Molecular Weight, Daltons):
+            Heavier molecules penetrate cell membranes poorly.
+            Toxic industrial chemicals often have unusual MW profiles.
+
+        MolLogP (Wildman-Crippen LogP):
+            Lipophilicity — how much a molecule prefers fat vs. water.
+            High LogP → accumulates in fatty tissue, crosses blood-brain barrier.
+            Many toxic compounds are highly lipophilic (PCBs, dioxins).
+
+        TPSA (Topological Polar Surface Area, Ų):
+            Sum of surface area from polar atoms (O, N, S).
+            Predicts: membrane permeability, GI absorption, CNS penetration.
+            TPSA < 90 Ų → good oral absorption.
+            TPSA > 140 Ų → poor CNS penetration.
+
+        NumHDonors (H-Bond Donors):
+            OH and NH groups. Too many → poor membrane penetration.
+
+        NumHAcceptors (H-Bond Acceptors):
+            O and N atoms. Drives aqueous solubility and binding interactions.
+
+        NumRotatableBonds:
+            Molecular flexibility. Very flexible molecules are often inactive
+            (entropy cost of binding) but also correlates with gut absorption.
+
+        NumAromaticRings:
+            Aromatic systems (benzene-like) are common in toxicophores.
+            Many mutagens and carcinogens have multiple fused aromatic rings
+            (PAHs — polycyclic aromatic hydrocarbons).
+
+        FractionCSP3 (sp3 Carbon Fraction):
+            "Three-dimensionality" of a molecule. Flat aromatic compounds
+            (low Fsp3) are often more toxic and less drug-like.
+
+        RingCount:
+            Total ring systems. Correlated with complexity, selectivity, toxicity.
+
+    Args:
+        mol: Valid RDKit Mol object
+
+    Returns:
+        Dictionary of descriptor name → float value
+    """
+    if mol is None:
+        return None
+
+    try:
+        return {
+            # --- Lipinski Ro5 Descriptors ---
+            "MolWt":             Descriptors.MolWt(mol),
+            "MolLogP":           Descriptors.MolLogP(mol),
+            "NumHDonors":        rdMolDescriptors.CalcNumHBD(mol),
+            "NumHAcceptors":     rdMolDescriptors.CalcNumHBA(mol),
+
+            # --- Membrane Permeability & CNS Penetration ---
+            "TPSA":              rdMolDescriptors.CalcTPSA(mol),
+
+            # --- Molecular Flexibility ---
+            "NumRotatableBonds": rdMolDescriptors.CalcNumRotatableBonds(mol),
+
+            # --- Structural Complexity ---
+            "NumAromaticRings":  rdMolDescriptors.CalcNumAromaticRings(mol),
+            "FractionCSP3":      rdMolDescriptors.CalcFractionCSP3(mol),
+            "RingCount":         rdMolDescriptors.CalcNumRings(mol),
+
+            # --- Electronic Properties ---
+            "MaxPartialCharge":  Descriptors.MaxPartialCharge(mol),
+            "MinPartialCharge":  Descriptors.MinPartialCharge(mol),
+
+            # --- Additional Toxicophore Indicators ---
+            "NumHeteroatoms":    rdMolDescriptors.CalcNumHeteroatoms(mol),
+            "NumStereocenters":  len(Chem.FindMolChiralCenters(mol, includeUnassigned=True)),
+        }
+    except Exception:
+        return None
+
+
+def featurize_molecule(smiles: str) -> Tuple[Optional[np.ndarray], Optional[dict]]:
+    """
+    Complete featurization pipeline for a single molecule.
+
+    COMBINED FEATURE STRATEGY:
+        We concatenate Morgan Fingerprints (2048 bits, topological) with
+        physicochemical descriptors (13 continuous features).
+
+        Total feature vector: 2048 + 13 = 2061 dimensions per molecule.
+
+        Why both?
+            - Morgan FP → "what structural patterns are present?"
+            - Physicochemical → "what are the global properties?"
+        Together, they provide complementary perspectives that improve
+        model performance over either alone.
+
+    Args:
+        smiles: SMILES string for the molecule
+
+    Returns:
+        Tuple of (fingerprint array, descriptor dict)
+        Returns (None, None) if molecule is invalid
+    """
+    mol = parse_smiles(smiles)
+    if mol is None:
+        return None, None
+
+    fp = compute_morgan_fingerprint(mol)
+    desc = compute_physicochemical_descriptors(mol)
+
+    if fp is None or desc is None:
+        return None, None
+
+    return fp, desc
+
+
+# =============================================================================
+# SECTION 3: Dataset Loading & Processing
+# =============================================================================
+
+def load_tox21_dataset(data_path: str) -> pd.DataFrame:
+    """
+    Load and perform initial quality checks on the Tox21 dataset.
+
+    DATASET STRUCTURE:
+        The Tox21 CSV contains:
+        - 'smiles': SMILES string for each compound
+        - 12 columns for each toxicity assay (NR-AR, NR-ER, etc.)
+        - 'mol_id': optional compound identifier
+
+        KNOWN ISSUES IN TOX21:
+        1. Missing labels: ~50-80% of assay values are NaN (not all compounds
+           were tested in all assays). We treat NaN as "unknown", not "negative."
+        2. Class imbalance: Active (toxic) compounds are a minority (~5-20%).
+        3. Invalid SMILES: A small fraction of entries have malformed SMILES.
+
+    Args:
+        data_path: Path to tox21.csv file
+
+    Returns:
+        Cleaned DataFrame with SMILES column and 12 assay columns
+    """
+    logger.info(f"Loading Tox21 dataset from: {data_path}")
+
+    df = pd.read_csv(data_path)
+    logger.info(f"  Raw dataset: {len(df)} compounds, {df.shape[1]} columns")
+
+    # Standardize column names — datasets sometimes use different casings
+    df.columns = [col.strip() for col in df.columns]
+
+    # Find the SMILES column (handles different naming conventions)
+    smiles_col = None
+    for candidate in ["smiles", "SMILES", "Smiles", "canonical_smiles"]:
+        if candidate in df.columns:
+            smiles_col = candidate
+            break
+
+    if smiles_col is None:
+        raise ValueError(
+            f"No SMILES column found. Available columns: {list(df.columns)}"
+        )
+
+    if smiles_col != "smiles":
+        df = df.rename(columns={smiles_col: "smiles"})
+
+    # Log class distribution for each assay (critical for understanding imbalance)
+    logger.info("Class distribution per assay:")
+    for assay in TOX21_ASSAYS:
+        if assay in df.columns:
+            counts = df[assay].value_counts()
+            total_labeled = counts.sum()
+            n_active = counts.get(1.0, 0)
+            n_missing = df[assay].isna().sum()
+            pct_active = 100 * n_active / total_labeled if total_labeled > 0 else 0
+            logger.info(
+                f"  {assay:20s}: {n_active:4d} active ({pct_active:.1f}%) | "
+                f"{n_missing:4d} unlabeled"
+            )
+
+    return df
+
+
+def build_feature_matrix(df: pd.DataFrame) -> Tuple[np.ndarray, pd.DataFrame, List[str]]:
+    """
+    Convert the raw DataFrame into a numerical feature matrix (X).
+
+    PIPELINE:
+        1. Parse each SMILES → RDKit Mol
+        2. Compute Morgan Fingerprint (2048 bits)
+        3. Compute physicochemical descriptors (13 features)
+        4. Concatenate → feature vector per molecule
+        5. Drop invalid molecules (those that fail parsing)
+
+    Returns:
+        X: np.ndarray of shape (n_valid_molecules, 2061)
+        valid_df: DataFrame filtered to valid molecules only
+        feature_names: List of feature names for interpretability
+    """
+    logger.info("Building feature matrix via cheminformatics featurization...")
+
+    fingerprints = []
+    descriptors_list = []
+    valid_mask = []
+
+    for i, smiles in enumerate(tqdm(df["smiles"], desc="Featurizing molecules")):
+        fp, desc = featurize_molecule(smiles)
+
+        if fp is None or desc is None:
+            valid_mask.append(False)
+        else:
+            fingerprints.append(fp)
+            descriptors_list.append(list(desc.values()))
+            valid_mask.append(True)
+
+    n_invalid = sum(1 for v in valid_mask if not v)
+    logger.info(
+        f"Featurization complete: {sum(valid_mask)} valid / {n_invalid} invalid SMILES dropped"
+    )
+
+    valid_df = df[valid_mask].reset_index(drop=True)
+
+    # Construct feature matrix
+    fp_matrix = np.array(fingerprints, dtype=np.float32)          # Shape: (N, 2048)
+    desc_matrix = np.array(descriptors_list, dtype=np.float32)     # Shape: (N, 13)
+
+    # Replace any NaN/Inf in descriptors (rare edge cases from RDKit)
+    desc_matrix = np.nan_to_num(desc_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
+    # Combine: [Morgan Fingerprint | Physicochemical Descriptors]
+    X = np.concatenate([fp_matrix, desc_matrix], axis=1)           # Shape: (N, 2061)
+
+    # Build interpretable feature names for SHAP analysis
+    fp_names = [f"FP_bit_{i}" for i in range(MORGAN_NBITS)]
+    desc_names = list(compute_physicochemical_descriptors(
+        parse_smiles("C")  # Methane as dummy molecule
+    ).keys())
+    feature_names = fp_names + desc_names
+
+    logger.info(f"Feature matrix shape: {X.shape}")
+    return X, valid_df, feature_names
+
+
+def build_label_matrix(valid_df: pd.DataFrame) -> np.ndarray:
+    """
+    Extract and clean the multi-task label matrix (Y).
+
+    MISSING LABEL STRATEGY:
+        Tox21 uses a semi-supervised setup: most compounds are only tested
+        in a SUBSET of the 12 assays. NaN = "not tested," NOT "non-toxic."
+
+        During training, we use only labeled samples per-task (masking).
+        This is the "incomplete multi-task" setting — models must handle it.
+
+        For the feature matrix we keep all samples; per-task, we filter to
+        only labeled rows during model fitting.
+
+    Returns:
+        Y: np.ndarray of shape (N, 12) with values {0, 1, NaN}
+           NaN marks unlabeled samples for each assay.
+    """
+    available_assays = [a for a in TOX21_ASSAYS if a in valid_df.columns]
+    missing_assays = [a for a in TOX21_ASSAYS if a not in valid_df.columns]
+
+    if missing_assays:
+        logger.warning(f"Assays not found in dataset: {missing_assays}")
+
+    Y = valid_df[available_assays].values.astype(float)
+
+    # Log missing data statistics
+    for i, assay in enumerate(available_assays):
+        n_missing = np.sum(np.isnan(Y[:, i]))
+        logger.info(f"  {assay}: {n_missing}/{len(Y)} unlabeled")
+
+    return Y, available_assays
+
+
+# =============================================================================
+# SECTION 4: Class Imbalance Handling
+# =============================================================================
+
+def get_class_weights(y_col: np.ndarray) -> dict:
+    """
+    Compute inverse-frequency class weights to address imbalance.
+
+    WHY CLASS WEIGHTING?
+        In Tox21, toxic compounds are a minority (sometimes only 5% of labeled
+        data). A naive model can achieve 95% accuracy by predicting "non-toxic"
+        always — but this is catastrophically wrong for drug safety.
+
+        Solution: weight each class inversely proportional to its frequency.
+        If toxic = 5% of data, its weight = 20x the non-toxic weight.
+        This forces the model to pay equal attention to both classes.
+
+    ALTERNATIVE CONSIDERED: SMOTE
+        SMOTE (Synthetic Minority Oversampling) creates synthetic minority
+        samples. For fingerprints (binary vectors), interpolation creates
+        chemically meaningless molecules. Class weighting is safer here.
+
+    Args:
+        y_col: 1D array of binary labels {0, 1} (NaN already removed)
+
+    Returns:
+        dict mapping {0: weight_0, 1: weight_1}
+    """
+    from sklearn.utils.class_weight import compute_class_weight
+
+    classes = np.array([0, 1])
+    weights = compute_class_weight("balanced", classes=classes, y=y_col)
+    return {0: weights[0], 1: weights[1]}
+
+
+# =============================================================================
+# SECTION 5: Main Pipeline Entry Point
+# =============================================================================
+
+def run_data_pipeline(data_path: str) -> dict:
+    """
+    Execute the complete data engineering pipeline.
+
+    DATA FLOW:
+        CSV → DataFrame → SMILES validation → Mol objects
+        → Morgan Fingerprints + Descriptors → Feature Matrix (X)
+        → Label Matrix (Y) → {X, Y, feature_names, assay_names}
+
+    Args:
+        data_path: Path to tox21.csv
+
+    Returns:
+        Dictionary with keys: X, Y, feature_names, assay_names, valid_df
+    """
+    logger.info("=" * 60)
+    logger.info("ToxIQ Data Pipeline — Starting")
+    logger.info("=" * 60)
+
+    # Step 1: Load raw data
+    df = load_tox21_dataset(data_path)
+
+    # Step 2: Build feature matrix via cheminformatics
+    X, valid_df, feature_names = build_feature_matrix(df)
+
+    # Step 3: Build multi-task label matrix
+    Y, assay_names = build_label_matrix(valid_df)
+
+    logger.info("=" * 60)
+    logger.info(f"Pipeline complete: X={X.shape}, Y={Y.shape}")
+    logger.info("=" * 60)
+
+    return {
+        "X": X,
+        "Y": Y,
+        "feature_names": feature_names,
+        "assay_names": assay_names,
+        "valid_df": valid_df,
+    }
+
+
+if __name__ == "__main__":
+    # Quick test with a synthetic single molecule
+    test_smiles = "CC(=O)Oc1ccccc1C(=O)O"  # Aspirin
+    print(f"\nTest molecule: Aspirin ({test_smiles})")
+    fp, desc = featurize_molecule(test_smiles)
+    if fp is not None:
+        print(f"  Morgan Fingerprint: {fp.shape} bits, {fp.sum()} active")
+        print(f"  Physicochemical Descriptors:")
+        for k, v in desc.items():
+            print(f"    {k:25s}: {v:.3f}")
+    else:
+        print("  ERROR: Featurization failed")
